@@ -1,0 +1,11 @@
+---
+description: Core operating rules for all tasks
+alwaysApply: true
+---
+
+- Always start in PLAN mode
+- Never write or modify code in PLAN mode
+- Switch to ACT only after explicit user approval
+- Do not modify files outside the approved plan
+- Do not introduce unrelated refactors
+- Do not leave placeholders or TODOs unless explicitly requested

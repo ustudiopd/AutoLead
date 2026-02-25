@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AutoLead - 리드 데이터 자동 보강</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1 class="title">AutoLead</h1>
+            <p class="subtitle">리드 데이터 자동 보강 시스템</p>
+        </header>
+
+        <main class="main">
+            <!-- 탭 네비게이션 -->
+            <div class="tabs">
+                <button class="tab-btn active" data-tab="process">데이터 처리</button>
+                <button class="tab-btn" data-tab="search">DART 검색</button>
+            </div>
+
+            <!-- 데이터 처리 탭 -->
+            <div class="tab-content active" id="processTab">
+            <!-- 파일 업로드 섹션 -->
+            <section class="section upload-section">
+                <h2 class="section-title">파일 업로드</h2>
+                <div class="upload-area" id="uploadArea">
+                    <input type="file" id="fileInput" accept=".csv" style="display: none;">
+                    <div class="upload-content">
+                        <svg class="upload-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                            <polyline points="17 8 12 3 7 8"></polyline>
+                            <line x1="12" y1="3" x2="12" y2="15"></line>
+                        </svg>
+                        <p class="upload-text">CSV 파일을 드래그하거나 클릭하여 업로드</p>
+                        <p class="upload-hint">CSV 파일만 지원됩니다</p>
+                    </div>
+                </div>
+                <div class="file-info" id="fileInfo" style="display: none;">
+                    <span class="file-name" id="fileName"></span>
+                    <button class="btn btn-secondary" id="removeFileBtn">제거</button>
+                </div>
+            </section>
+
+            <!-- 처리 시작 섹션 -->
+            <section class="section process-section">
+                <button class="btn btn-primary" id="processBtn" disabled>처리 시작</button>
+            </section>
+
+            <!-- 진행 상황 섹션 -->
+            <section class="section progress-section" id="progressSection" style="display: none;">
+                <h2 class="section-title">처리 진행 상황</h2>
+                <div class="progress-container">
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progressFill"></div>
+                    </div>
+                    <div class="progress-info">
+                        <span class="progress-text" id="progressText">0%</span>
+                        <span class="progress-detail" id="progressDetail">대기 중...</span>
+                    </div>
+                </div>
+                <div class="log-container" id="logContainer"></div>
+            </section>
+
+            <!-- 결과 섹션 -->
+            <section class="section results-section" id="resultsSection" style="display: none;">
+                <div class="results-header">
+                    <h2 class="section-title">처리 결과</h2>
+                    <div class="results-actions">
+                        <button class="btn btn-secondary" id="downloadBtn">CSV 다운로드</button>
+                    </div>
+                </div>
+                
+                <!-- 통계 -->
+                <div class="statistics" id="statistics">
+                    <div class="stat-item">
+                        <span class="stat-label">전체</span>
+                        <span class="stat-value" id="statTotal">0</span>
+                    </div>
+                    <div class="stat-item stat-high">
+                        <span class="stat-label">High</span>
+                        <span class="stat-value" id="statHigh">0</span>
+                    </div>
+                    <div class="stat-item stat-medium">
+                        <span class="stat-label">Medium</span>
+                        <span class="stat-value" id="statMedium">0</span>
+                    </div>
+                    <div class="stat-item stat-low">
+                        <span class="stat-label">Low</span>
+                        <span class="stat-value" id="statLow">0</span>
+                    </div>
+                </div>
+
+                <!-- 필터 -->
+                <div class="filters">
+                    <input type="text" class="search-input" id="searchInput" placeholder="검색...">
+                    <select class="filter-select" id="confidenceFilter">
+                        <option value="">모든 신뢰도</option>
+                        <option value="High">High</option>
+                        <option value="Medium">Medium</option>
+                        <option value="Low">Low</option>
+                    </select>
+                    <select class="filter-select" id="reviewFilter">
+                        <option value="">모든 상태</option>
+                        <option value="Approved">승인됨</option>
+                        <option value="Needs Review">검토 필요</option>
+                    </select>
+                </div>
+
+                <!-- 테이블 -->
+                <div class="table-container">
+                    <table class="data-table" id="resultsTable">
+                        <thead>
+                            <tr>
+                                <th>회사명</th>
+                                <th>이메일</th>
+                                <th>DART 회사명</th>
+                                <th>주소</th>
+                                <th>웹사이트</th>
+                                <th>KSIC 코드</th>
+                                <th>SIC 코드</th>
+                                <th>신뢰도</th>
+                                <th>상태</th>
+                            </tr>
+                        </thead>
+                        <tbody id="resultsTableBody">
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- 페이지네이션 -->
+                <div class="pagination" id="pagination"></div>
+            </section>
+            </div>
+
+            <!-- DART 검색 탭 -->
+            <div class="tab-content" id="searchTab" style="display: none;">
+                <section class="section search-section">
+                    <h2 class="section-title">DART 회사 검색</h2>
+                    <div class="search-form">
+                        <div class="form-group">
+                            <label for="companySearchInput">회사명</label>
+                            <input type="text" class="search-input" id="companySearchInput" placeholder="회사명을 입력하세요 (예: 씨제이올리브네트웍스)">
+                        </div>
+                        <div class="form-group">
+                            <label for="emailDomainInput">이메일 도메인 (선택)</label>
+                            <input type="text" class="search-input" id="emailDomainInput" placeholder="이메일 도메인 (예: cj.net)">
+                        </div>
+                        <button class="btn btn-primary" id="searchBtn">검색</button>
+                    </div>
+                </section>
+
+                <section class="section search-results-section" id="searchResultsSection" style="display: none;">
+                    <h2 class="section-title">검색 결과</h2>
+                    <div class="search-result-card" id="searchResultCard">
+                        <div class="result-loading" id="resultLoading" style="display: none;">
+                            <p>검색 중...</p>
+                        </div>
+                        <div class="result-content" id="resultContent"></div>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

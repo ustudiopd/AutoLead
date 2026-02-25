@@ -1,0 +1,8 @@
+---
+description: Rules for managing project memory and context
+---
+
+- memory_bank is the single source of truth
+- Always consult relevant memory_bank files before planning
+- Update memory_bank only when explicitly instructed or after major milestones
+- Keep memory concise, factual, and chronological

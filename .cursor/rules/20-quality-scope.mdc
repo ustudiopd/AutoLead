@@ -1,0 +1,8 @@
+---
+description: Code quality and scope control
+---
+
+- Follow conventions defined in techContext.md
+- Prefer clarity over cleverness
+- Avoid speculative features
+- Explicitly state assumptions before implementing
