@@ -30,3 +30,6 @@ uploads/
 
 # Logs
 *.log
+
+# Local cache
+.cache/

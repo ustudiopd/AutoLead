@@ -16,6 +16,7 @@ from typing import List, Optional, Tuple
 from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 import os
 import time
+import threading
 
 
 @dataclass
@@ -25,6 +26,17 @@ class WebEmployeeEvidence:
     page_title: str
     snippet: str
     method: str
+
+
+_openweb_kr_name_cache: dict[str, Optional[str]] = {}
+_openweb_kr_name_lock = threading.Lock()
+
+
+def _has_korean(s: str) -> bool:
+    try:
+        return any("가" <= ch <= "힣" for ch in (s or ""))
+    except Exception:
+        return False
 
 
 def _safe_text(s: object) -> str:
@@ -43,6 +55,18 @@ def _is_http_url(u: str) -> bool:
 def _domain(u: str) -> str:
     try:
         return (urlparse(u).netloc or "").lower()
+    except Exception:
+        return ""
+
+
+def _norm_lookup(s: str) -> str:
+    """회사명/도메인 비교를 위한 단순 정규화(영숫자만 + 공백 정리)."""
+    try:
+        import re
+        t = _safe_text(s).lower()
+        t = re.sub(r"[^0-9a-z가-힣]+", " ", t)
+        t = " ".join(t.split())
+        return t
     except Exception:
         return ""
 
@@ -78,6 +102,33 @@ def _fetch(url: str, timeout: int = 6) -> str:
     r = requests.get(url, timeout=timeout, headers=headers, allow_redirects=True)
     r.raise_for_status()
     return r.text
+
+
+def _fetch_rendered_text_playwright(url: str, timeout_sec: int = 8) -> str:
+    """
+    JS 렌더링이 필요한 페이지를 위해 Playwright로 렌더링된 텍스트를 가져온다.
+    - 기본 OFF(환경변수로 활성화)
+    - 실패해도 파이프라인을 중단하지 않도록 호출부에서 예외를 삼키는 형태로 사용
+    """
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            page.set_default_timeout(max(1000, int(timeout_sec * 1000)))
+            page.goto(url, wait_until="domcontentloaded")
+            try:
+                page.wait_for_load_state("networkidle", timeout=max(1000, int(timeout_sec * 1000)))
+            except Exception:
+                pass
+            txt = page.inner_text("body")
+            return " ".join((txt or "").split())
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
 
 def _ddg_search(query: str, max_results: int = 5, timeout: int = 8) -> List[Tuple[str, str, str]]:
@@ -199,6 +250,36 @@ def _extract_employee_mentions(page_text: str) -> List[str]:
     return uniq
 
 
+def _extract_jobkorea_employee_count(html: str) -> Optional[str]:
+    """
+    잡코리아 기업정보 페이지에서 '사원수 25명' 같은 명시값 추출.
+    (JS 렌더링이 아닌 정적 텍스트에 포함되는 케이스를 우선 지원)
+    """
+    if not html:
+        return None
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(" ", strip=True)
+    except Exception:
+        text = " ".join(str(html).split())
+    import re
+    m = re.search(r"사원수\s*([\d,]{1,9})\s*명", text)
+    if not m:
+        return None
+    raw = m.group(1)
+    raw = raw.replace(",", "").strip()
+    if not re.fullmatch(r"\d{1,9}", raw):
+        return None
+    try:
+        n = int(raw)
+        if n <= 0 or n >= 1000000:
+            return None
+    except Exception:
+        return None
+    return str(n)
+
+
 def _urls_from_web_crawler_search(company_name: str, country_hint: Optional[str], max_results: int) -> List[str]:
     """DDG 실패 시 WebCrawler.search_web 폴백."""
     try:
@@ -260,6 +341,68 @@ def find_employee_evidence_open_web(
     results: List[Tuple[str, str, str]] = []
     seen_urls: set[str] = set()
 
+    # 0) 잡코리아는 외부 검색엔진이 불안정할 수 있어, 내부 검색으로 기업정보 URL을 먼저 후보로 넣는다.
+    try:
+        jk_first = os.getenv("OPEN_WEB_JOBKOREA_INTERNAL_SEARCH", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        jk_first = True
+    name_for_jobkorea_match = name
+    if jk_first:
+        try:
+            from .portal_scrapers.jobkorea import search_company_pages
+
+            try:
+                jk_timeout = int(os.getenv("OPEN_WEB_HTTP_TIMEOUT", "6") or "6")
+            except Exception:
+                jk_timeout = 6
+
+            jk_urls = search_company_pages(name, timeout=jk_timeout, max_results=3)
+
+            # 영문 표기 회사는 잡코리아 내부검색이 안 잡히는 경우가 많아서 KR 힌트가 있으면 한글명 추정 후 재시도
+            if not jk_urls and (country_hint or "").upper().startswith("KR") and not _has_korean(name):
+                try:
+                    allow_kr = os.getenv("OPEN_WEB_ALLOW_GEMINI_KR", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
+                except Exception:
+                    allow_kr = True
+                if allow_kr:
+                    with _openweb_kr_name_lock:
+                        cached = _openweb_kr_name_cache.get(name)
+                    kr_name = cached
+                    if kr_name is None:
+                        try:
+                            from .gemini_client import GeminiClient
+                            gc = GeminiClient()
+                            kr_name = gc.infer_korean_company_name(name)
+                        except Exception:
+                            kr_name = None
+                        with _openweb_kr_name_lock:
+                            _openweb_kr_name_cache[name] = kr_name
+                    if kr_name:
+                        name_for_jobkorea_match = kr_name
+                        jk_urls = search_company_pages(kr_name, timeout=jk_timeout, max_results=3)
+
+            for u in jk_urls:
+                if u not in seen_urls:
+                    seen_urls.add(u)
+                    results.append((u, "JOBKOREA_INTERNAL_SEARCH", ""))
+        except Exception:
+            pass
+
+    # URL을 이미 알고 있는 경우(예: 잡코리아 링크를 사용자가 제공) 강제 주입
+    direct_url = (os.getenv("OPEN_WEB_DIRECT_URL", "") or "").strip()
+    direct_for = (os.getenv("OPEN_WEB_DIRECT_URL_FOR", "") or "").strip()
+    if direct_url and _is_http_url(direct_url):
+        if direct_for:
+            # 지정된 회사명(부분문자열)일 때만 direct URL 적용
+            if _norm_lookup(direct_for) not in _norm_lookup(name):
+                direct_url = ""
+    if direct_url and _is_http_url(direct_url):
+        results.append((direct_url, "DIRECT_URL", ""))
+        seen_urls.add(direct_url)
+        # direct URL이 있으면 검색 엔진 의존을 피하고 빠르게 해당 페이지만 처리
+        # (검색 단계가 환경에 따라 매우 느려질 수 있음)
+        max_search_results = 0
+
     # 1) WebCrawler.search_web(DDGS)을 먼저 실행해 실제 URL 확보 (DDG HTML은 차단 시 0건)
     try:
         from .web_crawler import WebCrawler
@@ -267,8 +410,26 @@ def find_employee_evidence_open_web(
             wc_timeout = int(os.getenv("OPEN_WEB_SEARCH_TIMEOUT", "4") or "4")
         except Exception:
             wc_timeout = 4
+        if max_search_results <= 0 or (time.monotonic() - started) > budget_sec:
+            raise Exception("skip_search")
+
         c = WebCrawler(timeout=wc_timeout)
-        for q in [f"{name} employees", f"{name} company size", f"{name} headcount", f"{name} 종업원 인력"]:
+        base_queries = [f"{name} employees", f"{name} company size", f"{name} headcount", f"{name} 종업원 인력"]
+
+        # 디렉토리 도메인만 강제 검색(site:)해서 "읽을 수 있게" 락인 (URL 공유 없이도 동작)
+        lockin_dirs = os.getenv("OPEN_WEB_LOCKIN_DIRECTORIES", "1").strip().lower() in {"1", "true", "yes", "y", "on"}
+        if lockin_dirs:
+            dir_domains = ["jobkorea.co.kr", "saramin.co.kr", "jobplanet.co.kr", "incruit.com"]
+            forced = []
+            for d in dir_domains:
+                forced.append(f"site:{d} {name} 사원수")
+                forced.append(f"site:{d} {name} 직원수")
+                forced.append(f"site:{d} {name} company employees")
+            base_queries = forced + base_queries
+
+        for q in base_queries:
+            if (time.monotonic() - started) > budget_sec:
+                break
             for u in c.search_web(q, max_results=max_search_results):
                 if u not in seen_urls:
                     seen_urls.add(u)
@@ -291,16 +452,18 @@ def find_employee_evidence_open_web(
         pass
 
     # 2) DDG HTML 검색으로 제목/스니펫 보강 (있으면 병합)
-    for q in queries:
-        if (time.monotonic() - started) > budget_sec:
-            break
-        part = _ddg_search(q, max_results=max_search_results, timeout=10)
-        for url, title, snippet in part:
-            if url not in seen_urls:
-                seen_urls.add(url)
-                results.append((url, title, snippet))
-        if len(results) >= max_search_results * 3:
-            break
+    # direct URL 모드(max_search_results<=0)에서는 검색 단계 자체를 건너뜀(속도/안정성)
+    if max_search_results > 0:
+        for q in queries:
+            if (time.monotonic() - started) > budget_sec:
+                break
+            part = _ddg_search(q, max_results=max_search_results, timeout=10)
+            for url, title, snippet in part:
+                if url not in seen_urls:
+                    seen_urls.add(url)
+                    results.append((url, title, snippet))
+            if len(results) >= max_search_results * 3:
+                break
 
     # 3) 공식 도메인 있으면 about/company 경로를 최우선 후보로 추가
     if official_domain_hint:
@@ -343,6 +506,89 @@ def find_employee_evidence_open_web(
             fetched += 1
         except Exception:
             continue
+
+        # 잡코리아 내부검색은 후보가 섞일 수 있어, 페이지 자체가 회사와 무관하면 아예 스킵한다.
+        if "jobkorea.co.kr" in _domain(url):
+            try:
+                from bs4 import BeautifulSoup
+                page_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+            except Exception:
+                page_text = ""
+            # 영문 회사명은 페이지에 그대로 안 나오는 케이스가 많아(한글 표기) 잡코리아 내부검색에서 한글명을 추정했다면 그걸 우선 사용
+            base_for_match = name_for_jobkorea_match if name_for_jobkorea_match else name
+            tokens = [t for t in _norm_lookup(base_for_match).split(" ") if len(t) >= 3]
+            if tokens and page_text:
+                pn = _norm_lookup(page_text)
+                if not any(t in pn for t in tokens[:4]):
+                    continue
+
+        # 잡코리아는 정적 텍스트에 '사원수 N명'이 노출되는 케이스가 있어 전용 파서 우선 적용
+        try:
+            if "jobkorea.co.kr" in _domain(url):
+                jk = _extract_jobkorea_employee_count(html)
+                if jk:
+                    evidences.append(
+                        WebEmployeeEvidence(
+                            value_raw=str(jk),
+                            url=url,
+                            page_title=title[:200] if title else "",
+                            snippet="jobkorea: 사원수",
+                            method="OPEN_WEB_JOBKOREA",
+                        )
+                    )
+                    # 전용 파서가 성공하면 추가 파싱은 생략
+                    continue
+        except Exception:
+            pass
+
+        # 잡코리아(및 JS-heavy 페이지) 렌더링 폴백: Playwright가 켜져있고, 예산이 남아있을 때만
+        try:
+            use_pw = os.getenv("OPEN_WEB_USE_PLAYWRIGHT", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+        except Exception:
+            use_pw = False
+        if use_pw and (time.monotonic() - started) <= budget_sec and ("jobkorea.co.kr" in _domain(url)):
+            try:
+                try:
+                    pw_timeout = float(os.getenv("OPEN_WEB_PLAYWRIGHT_TIMEOUT_SEC", "8") or "8")
+                    pw_timeout = max(2.0, min(20.0, pw_timeout))
+                except Exception:
+                    pw_timeout = 8.0
+                rendered = _fetch_rendered_text_playwright(url, timeout_sec=int(pw_timeout))
+                jk2 = _extract_employee_mentions(rendered)
+                # 전용 표현(사원수 N명)을 우선
+                jk_direct = None
+                try:
+                    import re as re_mod
+                    m = re_mod.search(r"사원수\s*([\d,]{1,9})\s*명", rendered)
+                    if m:
+                        jk_direct = m.group(1)
+                except Exception:
+                    jk_direct = None
+                if jk_direct:
+                    jk_direct = jk_direct.replace(",", "").strip()
+                    if jk_direct.isdigit():
+                        evidences.append(
+                            WebEmployeeEvidence(
+                                value_raw=str(int(jk_direct)),
+                                url=url,
+                                page_title=title[:200] if title else "",
+                                snippet="jobkorea: 사원수 (playwright)",
+                                method="OPEN_WEB_JOBKOREA",
+                            )
+                        )
+                        continue
+                for v in jk2[:2]:
+                    evidences.append(
+                        WebEmployeeEvidence(
+                            value_raw=v,
+                            url=url,
+                            page_title=title[:200] if title else "",
+                            snippet="jobkorea: rendered (playwright)",
+                            method="OPEN_WEB_JOBKOREA",
+                        )
+                    )
+            except Exception:
+                pass
 
         try:
             from bs4 import BeautifulSoup
