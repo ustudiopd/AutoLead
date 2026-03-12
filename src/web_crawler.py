@@ -2,11 +2,32 @@
 웹 크롤러 모듈
 이메일 도메인으로 웹사이트를 크롤링하여 회사명 추출
 """
+import re
 import requests
 from bs4 import BeautifulSoup
 from typing import Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, unquote
 import time
+
+
+def _resolve_ddg_redirect_url(href: str) -> Optional[str]:
+    """
+    DuckDuckGo HTML 검색 결과의 링크는 https://duckduckgo.com/l/?uddg=실제URL 형태.
+    실제 URL을 추출해 반환. DDG 링크가 아니면 href 그대로 반환.
+    """
+    if not href or not href.strip().startswith("http"):
+        return None
+    href = href.strip()
+    if "duckduckgo.com/l/" in href and "uddg=" in href:
+        try:
+            parsed = urlparse(href)
+            qs = parse_qs(parsed.query)
+            uddg = (qs.get("uddg") or [None])[0]
+            if uddg:
+                return unquote(uddg)
+        except Exception:
+            pass
+    return href if href.startswith("http") else None
 
 
 class WebCrawler:
@@ -35,6 +56,137 @@ class WebCrawler:
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
+
+    def search_web(self, query: str, max_results: int = 5) -> list[str]:
+        """
+        오픈 웹 검색(간이): DuckDuckGo HTML을 사용해 결과 URL을 수집.
+        DDG는 링크를 /l/?uddg=실제URL 로 감싸므로, 실제 URL을 추출해 반환.
+        """
+        if not query:
+            return []
+        q = " ".join(str(query).split())
+        urls: list[str] = []
+        try:
+            r = self.session.get(
+                "https://duckduckgo.com/html/",
+                params={"q": q},
+                timeout=self.timeout,
+                allow_redirects=True,
+                headers={"Accept-Language": "en-US,en;q=0.9"},
+            )
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+            # 1) 기존 선택자
+            for a in soup.select("a.result__a"):
+                href = (a.get("href") or "").strip()
+                real = _resolve_ddg_redirect_url(href)
+                if real:
+                    urls.append(real)
+            # 2) DDG 리다이렉트 링크가 있으면 모든 a[href*="uddg="] 에서 실제 URL 추출
+            if len(urls) < max_results:
+                for a in soup.find_all("a", href=True):
+                    href = (a.get("href") or "").strip()
+                    real = _resolve_ddg_redirect_url(href)
+                    if real and real not in urls and not real.startswith("https://duckduckgo.com"):
+                        urls.append(real)
+                    if len(urls) >= max_results * 3:
+                        break
+        except Exception:
+            return []
+
+        out: list[str] = []
+        seen: set[str] = set()
+        for u in urls:
+            if u in seen or not u.startswith("http"):
+                continue
+            try:
+                dom = urlparse(u).netloc or ""
+                if "duckduckgo.com" in dom:
+                    continue
+            except Exception:
+                continue
+            seen.add(u)
+            out.append(u)
+            if len(out) >= max_results:
+                break
+
+        # DuckDuckGo/Bing 직접 요청이 실패하면 duckduckgo-search 패키지 사용 (실제 URL 반환)
+        if len(out) < max_results:
+            try:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    from duckduckgo_search import DDGS
+                with DDGS() as ddgs:
+                    for row in ddgs.text(q, max_results=max_results, region="us-en"):
+                        link = (row.get("href") or row.get("link") or "").strip()
+                        if link.startswith("http") and link not in seen:
+                            try:
+                                if "duckduckgo.com" in (urlparse(link).netloc or ""):
+                                    continue
+                            except Exception:
+                                pass
+                            seen.add(link)
+                            out.append(link)
+                            if len(out) >= max_results:
+                                break
+            except Exception:
+                pass
+
+        return out
+
+    def fetch_page_text(self, url: str) -> tuple[str, str]:
+        """
+        임의 URL 페이지의 텍스트를 가져와 정제.
+        Returns:
+            (final_url, visible_text)
+        """
+        if not url or not str(url).strip().startswith("http"):
+            return ("", "")
+        try:
+            r = self.session.get(str(url).strip(), timeout=self.timeout, allow_redirects=True)
+            r.raise_for_status()
+            final_url = r.url or str(url).strip()
+            soup = BeautifulSoup(r.text, "html.parser")
+            # 스크립트/스타일 제거
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+            text = soup.get_text(" ", strip=True)
+            text = " ".join(text.split())
+            return (final_url, text)
+        except Exception:
+            return ("", "")
+
+    def extract_employee_count_from_text(self, text: str) -> tuple[Optional[str], str]:
+        """
+        페이지 텍스트에서 직원수로 보이는 단일 숫자를 추출.
+        영/한/다양한 표현 지원. Returns: (value, evidence_snippet)
+        """
+        if not text:
+            return (None, "")
+        import re
+
+        t = " ".join(str(text).split())
+        patterns = [
+            r"(?:employees|employee|staff|headcount|workforce)\s*[:\-]?\s*(\d{1,6})",
+            r"(\d{1,6})\s*(?:employees|employee|staff|headcount|people)\b",
+            r"(?:number of employees|company size|team size)\s*[:\-]?\s*(\d{1,6})",
+            r"(?:임직원|직원\s*수|종업원수|사원\s*수)\s*[:\-]?\s*(\d{1,6})",
+            r"(\d{1,6})\s*명\s*(?:임직원|직원|종업원|사원)?\b",
+            r"(?:전체\s*인원|인력\s*규모|회사\s*규모)\s*[:\-]?\s*(\d{1,6})",
+            r"(\d{1,6})\s*(?:명|인|people)\b",
+            r"(?:인력|종업원)\s*[:\-]?\s*(\d{1,6})\s*명",
+            r"(?:직원|인원|팀원|멤버)\s*[:\-]?\s*(\d{1,6})\s*명",
+            r"(\d{1,6})\s*(?:직원|인원|팀원)\b",
+            r"(?:members?|팀\s*구성)\s*[:\-]?\s*(\d{1,6})",
+        ]
+        for p in patterns:
+            m = re.search(p, t, re.IGNORECASE)
+            if m:
+                val = m.group(1)
+                s, e = max(m.start() - 40, 0), min(m.end() + 40, len(t))
+                return (val, t[s:e])
+        return (None, "")
     
     def extract_company_name_from_domain(self, domain: str) -> Optional[str]:
         """
@@ -49,9 +201,10 @@ class WebCrawler:
         if not domain:
             return None
         
-        # 개인 이메일 도메인 제외
+        # 개인/메일서비스 이메일 도메인 제외 (회사 사이트로 오인 방지)
         personal_domains = ['gmail.com', 'naver.com', 'daum.net', 'hanmail.net', 
-                           'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com']
+                           'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com',
+                           'maver.com', 'nate.com', 'kakao.com', 'kakao.co.kr']
         if domain.lower() in personal_domains:
             return None
         
@@ -79,6 +232,76 @@ class WebCrawler:
                 continue
         
         return None
+
+    def fetch_site_metadata(self, domain_or_url: str) -> dict:
+        """
+        홈페이지에서 메타 description/간단 소개/직원수 힌트 등을 추출.
+        Returns:
+            {"website": str|None, "description": str|None, "employees": str|None}
+        """
+        if not domain_or_url:
+            return {"website": None, "description": None, "employees": None}
+
+        s = str(domain_or_url).strip()
+        # 도메인이면 URL 후보 생성
+        urls_to_try = []
+        if "://" in s:
+            urls_to_try = [s]
+        else:
+            d = s.lower()
+            urls_to_try = [f"https://{d}", f"https://www.{d}", f"http://{d}", f"http://www.{d}"]
+
+        for url in urls_to_try:
+            try:
+                r = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+                r.raise_for_status()
+                final_url = r.url or url
+                soup = BeautifulSoup(r.text, "html.parser")
+
+                # description 후보: meta description → og:description → 첫 문장(h1/p)
+                desc = None
+                m = soup.find("meta", attrs={"name": "description"})
+                if m and m.get("content"):
+                    desc = m.get("content", "").strip()
+                if not desc:
+                    ogd = soup.find("meta", property="og:description")
+                    if ogd and ogd.get("content"):
+                        desc = ogd.get("content", "").strip()
+                if not desc:
+                    p = soup.find("p")
+                    if p:
+                        t = " ".join(p.get_text(" ").split())
+                        if t and len(t) >= 30:
+                            desc = t[:400]
+
+                # 직원수 힌트(매우 단순): "employees" 또는 "직원" 주변 숫자
+                employees = None
+                text = soup.get_text(" ", strip=True)
+                text = " ".join(text.split())
+                # 영문 패턴
+                import re
+                m1 = re.search(r"(\\d{1,6})\\s*(employees|employee)", text, re.IGNORECASE)
+                if m1:
+                    employees = m1.group(1)
+                # 한글 패턴
+                if not employees:
+                    m2 = re.search(r"(직원\\s*수\\s*[:\\-]?\\s*)(\\d{1,6})", text)
+                    if m2:
+                        employees = m2.group(2)
+                if not employees:
+                    m3 = re.search(r"(\\d{1,6})\\s*명\\s*(직원)?", text)
+                    if m3:
+                        employees = m3.group(1)
+
+                return {
+                    "website": final_url,
+                    "description": desc or None,
+                    "employees": employees or None,
+                }
+            except Exception:
+                continue
+
+        return {"website": None, "description": None, "employees": None}
     
     def _crawl_website(self, url: str) -> Optional[str]:
         """

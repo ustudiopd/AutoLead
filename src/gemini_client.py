@@ -244,6 +244,178 @@ class GeminiClient:
         except Exception as e:
             print(f"Gemini 업종 추론 오류: {str(e)}")
             return None
+
+    def pick_industry_from_choices(
+        self,
+        *,
+        company_name: str,
+        website: Optional[str],
+        description: Optional[str],
+        choices: List[str],
+    ) -> Optional[str]:
+        """
+        주어진 선택지(엑셀 Industry 탭) 중 하나를 반드시 골라 반환.
+        """
+        if not self.model or not choices:
+            return None
+
+        name = (company_name or "").strip()
+        site = (website or "").strip()
+        desc = (description or "").strip()
+        # 너무 긴 선택지는 토큰 낭비라 상한
+        choices_clean = [c.strip() for c in choices if c and str(c).strip()]
+
+        prompt = f"""아래 회사 정보를 보고, 주어진 업종 선택지 중에서 가장 적합한 **하나**를 골라주세요.
+
+회사명: {name or "(없음)"}
+웹사이트: {site or "(없음)"}
+설명: {desc[:500] or "(없음)"}
+
+업종 선택지(이 중에서만 답변):
+{chr(10).join("- " + c for c in choices_clean)}
+
+규칙:
+- 반드시 위 선택지 중 하나를 그대로 출력하세요.
+- 확신이 없으면 Other를 선택하세요.
+"""
+        try:
+            resp = self.model.generate_content(prompt)
+            ans = (resp.text or "").strip().strip('"').strip("'")
+            # 선택지 그대로 매칭
+            for c in choices_clean:
+                if ans == c:
+                    return c
+            # 대소문자/공백 정규화 매칭
+            ans_n = " ".join(ans.split()).lower()
+            for c in choices_clean:
+                if ans_n == " ".join(c.split()).lower():
+                    return c
+            # 실패 시 Other
+            for c in choices_clean:
+                if c.strip().lower() == "other":
+                    return c
+            return choices_clean[0]
+        except Exception as e:
+            print(f"Gemini 업종 선택 오류: {str(e)}")
+            return None
+
+    def infer_employee_count(
+        self,
+        *,
+        company_name: str,
+        website: Optional[str],
+        description: Optional[str],
+    ) -> Optional[str]:
+        """
+        직원 수를 추정해 실제 숫자만 반환. (예: '50', '120', '1000') 범위(1-10 등) 사용 금지.
+        """
+        if not self.model:
+            return None
+        name = (company_name or "").strip()
+        site = (website or "").strip()
+        desc = (description or "").strip()
+        prompt = f"""아래 회사 정보를 보고, 해당 회사의 직원 수를 추정한 **정확한 숫자 하나**만 답하세요.
+
+회사명: {name or "(없음)"}
+웹사이트: {site or "(없음)"}
+설명: {desc[:700] or "(없음)"}
+
+규칙:
+- 답변은 반드시 숫자만 출력하세요. 예: 50, 120, 1000
+- 범위(1-10, 51-200 등)나 설명은 쓰지 마세요.
+- 알 수 없으면 빈칸으로 두거나 0만 출력하세요.
+"""
+        try:
+            import re
+            resp = self.model.generate_content(prompt)
+            ans = (resp.text or "").strip().splitlines()[0].strip()
+            ans = ans.strip('"').strip("'").replace(",", "")
+            # 숫자만 추출 (첫 번째 정수)
+            m = re.search(r"\b(\d{1,7})\b", ans)
+            if m:
+                num = m.group(1)
+                if int(num) > 0:
+                    return num
+            return None
+        except Exception as e:
+            print(f"Gemini 직원수 추정 오류: {str(e)}")
+            return None
+
+    def infer_korean_company_name(self, company_name: str) -> Optional[str]:
+        """
+        영문/혼용 회사명을 보고 나이스 DB용 한글 회사명(공식명) 하나만 추론.
+        같은 회사를 찾을 때 사용. 모르면 None.
+        """
+        if not self.model or not (company_name or "").strip():
+            return None
+        name = (company_name or "").strip()
+        prompt = f"""다음 회사명은 한국에 있는 회사의 영문/영문표기 이름입니다.
+이 회사의 **한국어 공식 회사명**(한글업체명)을 하나만 답하세요. 예: 삼성전자(주), 현대자동차, SK텔레콤.
+
+회사명: {name}
+
+규칙:
+- 반드시 한글 회사명만 출력하세요. (주), (유) 등은 포함해도 됨.
+- 다른 회사가 아니고 이 회사와 동일한 회사인지 확실할 때만 답하세요.
+- 모르거나 확실하지 않으면 NONE만 답하세요.
+- 답변은 회사명 한 줄만."""
+        try:
+            resp = self.model.generate_content(prompt)
+            ans = (resp.text or "").strip().splitlines()[0].strip().strip('"').strip("'")
+            if not ans or ans.upper() == "NONE":
+                return None
+            return ans
+        except Exception as e:
+            print(f"Gemini 한글회사명 추론 오류: {str(e)}")
+            return None
+
+    def infer_company_website(
+        self,
+        company_name: str,
+        description: Optional[str] = None,
+        country: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        회사명(및 설명·국가)으로 공식 웹사이트 URL을 추론.
+        검색 결과에 나올 만한 실제 회사 사이트 하나만 반환.
+        """
+        if not self.model or not (company_name or "").strip():
+            return None
+        import re
+        name = (company_name or "").strip()
+        desc = (description or "").strip()[:500]
+        country_str = (country or "").strip()
+        context = f"회사명: {name}"
+        if desc:
+            context += f"\n설명: {desc}"
+        if country_str:
+            context += f"\n국가/지역: {country_str}"
+        prompt = f"""다음 기업의 **공식 웹사이트 URL** 하나만 알려주세요.
+
+{context}
+
+규칙:
+- 반드시 실제로 존재하는 기업 공식/소개 페이지 URL만 답하세요.
+- 검색엔진·포털 메인 페이지는 쓰지 마세요. (예: Google이면 google.com 검색창이 아니라 about.google 같은 회사 소개 페이지, 네이버면 naver.com이 아니라 해당 회사의 공식 사이트)
+- 대기업/유명 기업은 회사 소개·About·코퍼레이트 페이지를 우선하세요. (예: about.google, www.samsung.com, about.amazon)
+- 개인 이메일/메일서비스 도메인(gmail, naver, maver 등)은 답하지 마세요.
+- 존재하지 않거나 확실하지 않은 사이트는 답하지 마세요. 모르면 NONE만 답하세요.
+- 답변은 URL만 한 줄로 출력하세요. 설명 없이 URL만."""
+        try:
+            resp = self.model.generate_content(prompt)
+            ans = (resp.text or "").strip().splitlines()[0].strip().strip('"').strip("'")
+            if not ans or ans.upper() == "NONE":
+                return None
+            # https 없으면 추가
+            if not ans.startswith("http://") and not ans.startswith("https://"):
+                ans = "https://" + ans
+            # 유효한 URL 형태인지 (도메인 포함)
+            if re.search(r"^https?://[^\s/]+", ans):
+                return ans
+            return None
+        except Exception as e:
+            print(f"Gemini 웹사이트 추론 오류: {str(e)}")
+            return None
     
     def convert_ksic_to_sic(
         self,
